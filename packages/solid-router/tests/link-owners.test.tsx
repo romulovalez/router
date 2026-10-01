@@ -343,3 +343,65 @@ describe('Link owners and props (client)', () => {
     ).toEqual([])
   })
 })
+
+describe('path-only link state cache', () => {
+  test('links that name only a path resolve once per location', async () => {
+    const router = await createTestRouter(false)
+    const buildLocation = vi.spyOn(router, 'buildLocation')
+    const { getAllByRole } = render(() => (
+      <RouterContextProvider router={router}>
+        {() => (
+          <>
+            <Link to="/about">About link</Link>
+            <Link to="/about">About link</Link>
+            <Link to="/about" disabled>
+              About link
+            </Link>
+            <Link to="/about" search={{ tab: 'team' } as never}>
+              About link
+            </Link>
+          </>
+        )}
+      </RouterContextProvider>
+    ))
+    const snapshot = () =>
+      getAllByRole('link').map((el) => [
+        el.getAttribute('href'),
+        el.getAttribute('aria-current'),
+      ])
+    const builtFor = () =>
+      buildLocation.mock.calls.filter(
+        // a link builds from the location it renders against; navigate does not
+        ([opts]) => opts.to === '/about' && '_fromLocation' in opts,
+      ).length
+
+    const before = snapshot()
+    const builtBefore = builtFor()
+
+    await router.navigate({ to: '/about' })
+    Solid.flush()
+
+    expect({
+      before,
+      builtBefore,
+      after: snapshot(),
+      builtAfter: builtFor() - builtBefore,
+    }).toEqual({
+      before: [
+        ['/about', null],
+        ['/about', null],
+        [null, null],
+        ['/about?tab=team', null],
+      ],
+      // one for the two plain links, one for the disabled, one uncached
+      builtBefore: 3,
+      after: [
+        ['/about', 'page'],
+        ['/about', 'page'],
+        [null, 'page'],
+        ['/about?tab=team', null],
+      ],
+      builtAfter: 3,
+    })
+  })
+})

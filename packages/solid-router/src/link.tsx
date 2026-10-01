@@ -109,12 +109,16 @@ type LinkPreload = false | 'intent' | 'viewport' | 'render' | undefined
 interface LinkState {
   current: ParsedLocation
   opts: Record<string, any>
-  next: ParsedLocation
   href: string | undefined
   externalLink: string | undefined
   preload: LinkPreload
   isActive: boolean
+  // What a link compares of its built location; a preload builds its own.
+  nextHref: string
+  nextExternal: boolean
+  maskedHref: string | undefined
   hydrated?: boolean
+  hideHash?: boolean
 }
 
 /**
@@ -158,9 +162,9 @@ function sameLinkState(a: LinkState, b: LinkState) {
       a.externalLink === b.externalLink &&
       a.preload === b.preload &&
       a.isActive === b.isActive &&
-      a.next.href === b.next.href &&
-      a.next.external === b.next.external &&
-      a.next.maskedLocation?.href === b.next.maskedLocation?.href)
+      a.nextHref === b.nextHref &&
+      a.nextExternal === b.nextExternal &&
+      a.maskedHref === b.maskedHref)
   )
 }
 
@@ -221,7 +225,78 @@ function resolveLinkState(
     !externalLink &&
     testActive(opts.activeOptions, current, next, router, hideHash)
 
-  return { current, opts, next, href, externalLink, preload, isActive }
+  return {
+    current,
+    opts,
+    href,
+    externalLink,
+    preload,
+    isActive,
+    nextHref: next.href,
+    nextExternal: next.external,
+    maskedHref: next.maskedLocation?.href,
+  }
+}
+
+interface LinkStateCache {
+  location: ParsedLocation
+  ids: Array<string>
+  entries: Map<string, Array<LinkState>>
+}
+
+const linkStateCaches = new WeakMap<AnyRouter, LinkStateCache>()
+
+/**
+ * A nav renders the same few targets on every page, often more than once (a
+ * top bar, a sidebar, a footer), so a link that names only a path is resolved
+ * once per location and matched routes. A link with params, search, hash,
+ * state, a mask or a `from` is resolved uncached: keying those costs more
+ * than resolving them.
+ */
+function cachedLinkState(
+  router: AnyRouter,
+  opts: Record<string, any>,
+  current: ParsedLocation,
+  hideHash: boolean,
+): LinkState {
+  if (
+    typeof opts.to !== 'string' ||
+    opts.params !== undefined ||
+    opts.search !== undefined ||
+    opts.hash !== undefined ||
+    opts.state !== undefined ||
+    opts.mask !== undefined ||
+    opts.from !== undefined ||
+    opts.unsafeRelative !== undefined
+  ) {
+    return resolveLinkState(router, opts, current, hideHash)
+  }
+  const ids = Solid.untrack(() => router.stores.ids.get())
+  let cache = linkStateCaches.get(router)
+  if (!cache || cache.location !== current || cache.ids !== ids) {
+    cache = { location: current, ids, entries: new Map() }
+    linkStateCaches.set(router, cache)
+  }
+  const entries = cache.entries.get(opts.to)
+  if (entries) {
+    for (const state of entries) {
+      const o = state.opts
+      if (
+        state.hideHash === hideHash &&
+        o.activeOptions === opts.activeOptions &&
+        o.disabled === opts.disabled &&
+        o.reloadDocument === opts.reloadDocument &&
+        o.preload === opts.preload
+      ) {
+        return { ...state, opts }
+      }
+    }
+  }
+  const state = resolveLinkState(router, opts, current, hideHash)
+  state.hideHash = hideHash
+  if (entries) entries.push(state)
+  else cache.entries.set(opts.to, [state])
+  return state
 }
 
 function hasSimpleStyling(opts: Record<string, any>) {
@@ -308,7 +383,7 @@ function linkProps(
     // on both sides.
     const owner = Solid.createOwner()
     const resolved = Solid.runWithOwner(owner, () =>
-      resolveLinkState(
+      cachedLinkState(
         router,
         readRouteOptions(options),
         router.stores.location.get(),
@@ -333,13 +408,15 @@ function linkProps(
         ) {
           return last
         }
-        last = resolveLinkState(
-          router,
-          opts,
-          current,
-          shouldHydrateHash && !hydrated,
-        )
-        last.hydrated = hydrated
+        last = {
+          ...cachedLinkState(
+            router,
+            opts,
+            current,
+            shouldHydrateHash && !hydrated,
+          ),
+          hydrated,
+        }
         return last
       },
       { lazy: true, equals: sameLinkState },
@@ -575,10 +652,7 @@ function createLinkActions(
 
   const doPreload = () =>
     router
-      .preloadRoute({
-        ...Solid.untrack(() => readRouteOptions(options)),
-        _builtLocation: Solid.untrack(state).next,
-      } as any)
+      .preloadRoute(Solid.untrack(() => readRouteOptions(options)) as any)
       .catch((err: any) => {
         console.warn(err)
         console.warn(preloadWarning)
