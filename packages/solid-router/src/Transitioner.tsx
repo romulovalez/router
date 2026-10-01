@@ -2,6 +2,7 @@ import * as Solid from 'solid-js'
 import { getLocationChangeInfo, trimPathRight } from '@tanstack/router-core'
 import { isServer } from '@tanstack/router-core/isServer'
 import { useRouter } from './useRouter'
+import { markHydrated } from './ClientOnly'
 import type { NavigationRef } from 'solid-js'
 import type { AnyRouteMatch } from '@tanstack/router-core'
 
@@ -160,6 +161,7 @@ export function Transitioner() {
 export function Rendered() {
   const router = useRouter()
   Solid.onSettled(() => {
+    if (!(isServer ?? router.isServer)) markHydrated()
     const resolvedLocation = getResolvedLocation(router)
     if (resolvedLocation) {
       router.emit({
