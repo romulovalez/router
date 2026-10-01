@@ -1,0 +1,31 @@
+.changeset/solid-link-path-cache.md
+  s_b15c8bc521b310::t_6bf59e1ed9a8d1 1-5
+packages/solid-router/src/link.tsx
+  s_39b2c23f5658ab::t_5ffdaf43d813da 116-119,121,165-167,228-299,386,411-419,655
+packages/solid-router/tests/link-owners.test.tsx
+  s_39b2c23f5658ab::t_7e1aefb863994c 346-407
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "f1a72f429588d2ceffa6bdc6454f9a6acd61fb58",
+  "prompts": {},
+  "sessions": {
+    "s_39b2c23f5658ab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a428003d-c9e7-41f0-807f-7b187747523a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Rómulo Ochoa Valez <romulovalez@gmail.com>"
+    },
+    "s_b15c8bc521b310": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23863e94-2871-46ba-b352-c8c7cd177ed3",
+        "model": "unknown"
+      },
+      "human_author": "Rómulo Ochoa Valez <romulovalez@gmail.com>"
+    }
+  }
+}
