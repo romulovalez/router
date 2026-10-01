@@ -1,0 +1,35 @@
+packages/solid-router/tests/linkOwnerCases.tsx
+  s_b15c8bc521b310::t_fbad0432e9c1ce 200-215
+  s_b15c8bc521b310::t_39fa5ba0a4f36b 1-199
+packages/solid-router/tests/useHydrated.test.tsx
+  s_b15c8bc521b310::t_26a8d59c313b31 1-43
+packages/solid-router/tests/link-owners.test.tsx
+  s_b15c8bc521b310::t_f3307a19e20b69 330-345
+  s_b15c8bc521b310::t_e62cf184096173 1-329
+packages/solid-router/tests/server/link-owners.test.tsx
+  s_b15c8bc521b310::t_d0406a20729430 1-81
+packages/solid-router/src/ClientOnly.tsx
+  s_b15c8bc521b310::t_e30067b9849df7 77-85
+packages/solid-router/src/Transitioner.tsx
+  s_b15c8bc521b310::t_4f746ec2f228cf 5,164
+.changeset/solid-link-one-owner.md
+  s_b15c8bc521b310::t_89fec915035bef 1-5
+packages/solid-router/src/link.tsx
+  s_b15c8bc521b310::t_78d58b330dda54 24,34-39,47,54-265,275-290,292-301,303-380,382-387,389-408,410-418,420-424,426-446,448-462,465-466,468-476,478-508,510-515,517-550,553-557,559-574,578-581,587-588,594,601,605,615,617,619,626-628,638,641,652-659,663-664,666-674,676-677,679-687,689,691-694,696-707,709-722,725-731,735-739,884-895,897-902,906-913,921-931,935-936
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "294208d131230a67403d5047475d04f9562df246",
+  "prompts": {},
+  "sessions": {
+    "s_b15c8bc521b310": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "23863e94-2871-46ba-b352-c8c7cd177ed3",
+        "model": "unknown"
+      },
+      "human_author": null
+    }
+  }
+}
