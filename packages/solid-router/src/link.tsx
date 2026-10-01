@@ -21,6 +21,7 @@ import type {
   AnyRouter,
   Constrain,
   LinkOptions,
+  ParsedLocation,
   RegisteredRouter,
   RoutePaths,
 } from '@tanstack/router-core'
@@ -30,41 +31,236 @@ import type {
 } from './typePrimitives'
 import type { ComponentProps, JSX, ValidComponent } from '@solidjs/web'
 
-function mergeRefs<T>(...refs: Array<unknown>): (el: T) => void {
-  const setRef = (ref: unknown, el: T) => {
-    if (typeof ref === 'function') {
-      ref(el)
-    } else if (Array.isArray(ref)) {
-      for (const nestedRef of ref) {
-        setRef(nestedRef, el)
-      }
-    }
-  }
-
-  return (el: T) => {
-    for (const ref of refs) {
-      setRef(ref, el)
-    }
-  }
-}
+// Solid 2 mints hydration keys from positions in the owner tree, so a Link
+// must create the same owners on the server as on the client. It creates one:
+// a memo on the client that resolves the link's whole state, and a bare owner
+// in the same position on the server, where the state is resolved once
+// (#8316 on the 1.x line). Every branch below that decides which owners exist
+// reads only values both sides see identically at setup.
 
 function splitProps<T extends Record<string, any>, TKey extends keyof T>(
   props: T,
   keys: ReadonlyArray<TKey>,
 ): [Pick<T, TKey>, Omit<T, TKey>] {
-  const _local = {} as Pick<T, TKey>
-  const _rest = {} as Omit<T, TKey>
-
-  // A safe way to polyfill splitProps if native getter copy is too complex
-  // is just to return [props, Solid.omit(props, keys)] but it modifies typing.
-  // Actually, Solid.omit exists!
-  // Note: Solid.omit uses rest params (...keys), so we must spread the array.
   return [props as any, Solid.omit(props, ...(keys as any)) as any]
 }
+
 const timeoutMap = new WeakMap<object, ReturnType<typeof setTimeout>>()
 const cancelPreload = (eventTarget: object) => {
   clearTimeout(timeoutMap.get(eventTarget))
   timeoutMap.delete(eventTarget)
+}
+
+/** The props `useLinkProps` consumes itself; everything else reaches the anchor. */
+const LINK_OPTION_KEYS = new Set([
+  'activeProps',
+  'inactiveProps',
+  'activeOptions',
+  'to',
+  'preload',
+  'preloadDelay',
+  'preloadIntentProximity',
+  'hashScrollIntoView',
+  'replace',
+  'startTransition',
+  'resetScroll',
+  'viewTransition',
+  'target',
+  'disabled',
+  'style',
+  'class',
+  'onClick',
+  'onBlur',
+  'onFocus',
+  'onMouseEnter',
+  'onMouseLeave',
+  'onMouseOver',
+  'onMouseOut',
+  'onTouchStart',
+  'ignoreBlocker',
+  'params',
+  'search',
+  'hash',
+  'state',
+  'mask',
+  'reloadDocument',
+  'unsafeRelative',
+  'from',
+  'ref',
+])
+/** The props `Link` consumes itself. */
+const LINK_COMPONENT_KEYS = new Set(['_asChild', 'children', 'type'])
+const INTENT_KEYS = [
+  'onBlur',
+  'onFocus',
+  'onMouseEnter',
+  'onMouseOver',
+  'onMouseLeave',
+  'onMouseOut',
+  'onTouchStart',
+] as const
+type IntentKey = (typeof INTENT_KEYS)[number]
+
+/** Marks a server reader that forwards the caller's prop unchanged. */
+const FORWARDED = () => undefined
+
+type LinkPreload = false | 'intent' | 'viewport' | 'render' | undefined
+
+interface LinkState {
+  current: ParsedLocation
+  opts: Record<string, any>
+  next: ParsedLocation
+  href: string | undefined
+  externalLink: string | undefined
+  preload: LinkPreload
+  isActive: boolean
+  hydrated?: boolean
+}
+
+/**
+ * Copies `key` from `source` onto `target`: a data property as data, an
+ * accessor as a getter re-read on `source`, since the Solid compiler shares
+ * one descriptor per dynamic prop whose getter reads its closure off `this`.
+ */
+function forwardProp(target: object, source: object, key: string) {
+  const descriptor = Object.getOwnPropertyDescriptor(source, key)
+  Object.defineProperty(
+    target,
+    key,
+    descriptor && !descriptor.get && !descriptor.set
+      ? descriptor
+      : {
+          get: () => (source as Record<string, unknown>)[key],
+          enumerable: true,
+          configurable: true,
+        },
+  )
+}
+
+function isAccessor(source: object, key: string) {
+  const descriptor = Object.getOwnPropertyDescriptor(source, key)
+  return !!descriptor && (!!descriptor.get || !!descriptor.set)
+}
+
+function sameOptions(a: Record<string, any>, b: Record<string, any>) {
+  const keys = Object.keys(a)
+  if (keys.length !== Object.keys(b).length) return false
+  for (const key of keys) {
+    if (a[key] !== b[key]) return false
+  }
+  return true
+}
+
+function sameLinkState(a: LinkState, b: LinkState) {
+  return (
+    a === b ||
+    (a.href === b.href &&
+      a.externalLink === b.externalLink &&
+      a.preload === b.preload &&
+      a.isActive === b.isActive &&
+      a.next.href === b.next.href &&
+      a.next.external === b.next.external &&
+      a.next.maskedLocation?.href === b.next.maskedLocation?.href)
+  )
+}
+
+/** A link's route options: every prop but the `Link` component's own. */
+function readRouteOptions(options: Record<string, any>) {
+  const out: Record<string, any> = {}
+  for (const key of Object.keys(options)) {
+    if (key !== 'children' && key !== '_asChild') out[key] = options[key]
+  }
+  return out
+}
+
+function resolveLinkState(
+  router: AnyRouter,
+  opts: Record<string, any>,
+  current: ParsedLocation,
+  hideHash: boolean,
+): LinkState {
+  // untrack because router-core will also access stores, which are signals in solid
+  const next = Solid.untrack(() =>
+    router.buildLocation({ _fromLocation: current, ...opts } as any),
+  )
+
+  let href: string | undefined
+  let externalHref: string | undefined
+  if (!opts.disabled) {
+    // Use publicHref - it contains the correct href for display
+    // When a rewrite changes the origin, publicHref is the full URL
+    // Otherwise it's the origin-stripped path
+    const location = next.maskedLocation ?? next
+    if (location.external) {
+      href = location.publicHref
+      externalHref = location.publicHref
+    } else {
+      href = router.history.createHref(location.publicHref) || '/'
+    }
+  }
+
+  let externalLink: string | undefined
+  if (externalHref !== undefined) {
+    // Block dangerous protocols for external links
+    if (isDangerousProtocol(externalHref, router.protocolAllowlist)) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.warn(`Blocked Link with dangerous protocol: ${externalHref}`)
+      }
+    } else {
+      externalLink = externalHref
+    }
+  } else {
+    externalLink = externalTo(opts.to, router)
+  }
+
+  const preload: LinkPreload =
+    opts.reloadDocument || externalLink || opts.disabled
+      ? false
+      : (opts.preload ?? router.options.defaultPreload)
+  const isActive =
+    !externalLink &&
+    testActive(opts.activeOptions, current, next, router, hideHash)
+
+  return { current, opts, next, href, externalLink, preload, isActive }
+}
+
+function hasSimpleStyling(opts: Record<string, any>) {
+  return (
+    opts.activeProps === undefined &&
+    opts.inactiveProps === undefined &&
+    opts.class === undefined &&
+    opts.style === undefined
+  )
+}
+
+function resolveStateProps(
+  opts: Record<string, any>,
+  isActive: boolean,
+): Record<string, any> {
+  return (
+    (isActive
+      ? functionalUpdate(opts.activeProps ?? STATIC_ACTIVE_PROPS, {})
+      : functionalUpdate(opts.inactiveProps ?? EMPTY_OBJECT, {})) ??
+    EMPTY_OBJECT
+  )
+}
+
+function stateClass(
+  opts: Record<string, any>,
+  isActive: boolean,
+  stateProps: Record<string, any>,
+) {
+  if (hasSimpleStyling(opts)) return isActive ? 'active' : undefined
+  return [opts.class, stateProps.class].filter(Boolean).join(' ') || undefined
+}
+
+function stateStyle(
+  opts: Record<string, any>,
+  stateProps: Record<string, any>,
+) {
+  if (hasSimpleStyling(opts)) return opts.style
+  const style = { ...opts.style, ...stateProps.style }
+  return hasKeys(style) ? style : undefined
 }
 
 export function useLinkProps<
@@ -76,238 +272,337 @@ export function useLinkProps<
 >(
   options: UseLinkPropsOptions<TRouter, TFrom, TTo, TMaskFrom, TMaskTo>,
 ): ComponentProps<'a'> {
+  return linkProps(options as Record<string, any>, false) as any
+}
+
+/**
+ * The anchor props of a link. For `Link` (`fromLink`) rendering a plain
+ * anchor on the server, this is a function returning them: `ssrElement` calls
+ * it right after taking the anchor's hydration key, which is where the
+ * client's `spread()` reads the same getters. A prop may be an accessor that
+ * builds nodes on every read (Solid 2 compiles a ternary prop to a memo), and
+ * those nodes take hydration ids, so each prop is read where, and as often
+ * as, the client reads it.
+ */
+function linkProps(
+  options: Record<string, any>,
+  fromLink: boolean,
+): Record<string, any> | (() => Record<string, any>) {
   const router = useRouter()
-  const shouldHydrateHash = !isServer && !!router.options.ssr
-  const hasHydrated = useHydrated()
+  const server = isServer ?? router.isServer
 
-  let hasRenderFetched = false
-
-  // Defaults are resolved through accessors at the use sites instead of
-  // merging them into the props. Every merge/omit proxy layered here gets
-  // re-enumerated by spread() on each navigation, and V8 dispatches proxy
-  // traps in native runtime code — keeping this path proxy-free is what
-  // keeps Link updates cheap.
-  const local = options
-  const activeProps = () => local.activeProps ?? STATIC_ACTIVE_PROPS_GET
-  const inactiveProps = () => local.inactiveProps ?? STATIC_INACTIVE_PROPS_GET
-
-  const propsSafeToSpread = Solid.omit(
-    options as Record<string, any>,
-    'activeProps',
-    'inactiveProps',
-    'activeOptions',
-    'to',
-    'preload',
-    'preloadDelay',
-    'preloadIntentProximity',
-    'hashScrollIntoView',
-    'replace',
-    'startTransition',
-    'resetScroll',
-    'viewTransition',
-    'target',
-    'disabled',
-    'style',
-    'class',
-    'onClick',
-    'onBlur',
-    'onFocus',
-    'onMouseEnter',
-    'onMouseLeave',
-    'onMouseOver',
-    'onMouseOut',
-    'onTouchStart',
-    'ignoreBlocker',
-    'params',
-    'search',
-    'hash',
-    'state',
-    'mask',
-    'reloadDocument',
-    'unsafeRelative',
-    'from',
+  // Read once, identically on both sides: these decide which owners exist,
+  // never what they compute.
+  const [requestedPreload, includeHashAtSetup] = Solid.untrack(
+    () =>
+      [
+        (options.preload ?? router.options.defaultPreload) as LinkPreload,
+        !!options.activeOptions?.includeHash,
+      ] as const,
   )
+  const hasHydrated = includeHashAtSetup ? useHydrated() : undefined
 
-  const currentLocation = Solid.createMemo(() => router.stores.location.get(), {
-    equals: (prev, next) => prev.href === next.href,
+  let state: Solid.Accessor<LinkState>
+  if (server) {
+    // The owner the client's memo would be; route options are read under it
+    // on both sides.
+    const owner = Solid.createOwner()
+    const resolved = Solid.runWithOwner(owner, () =>
+      resolveLinkState(
+        router,
+        readRouteOptions(options),
+        router.stores.location.get(),
+        false,
+      ),
+    )
+    state = () => resolved
+  } else {
+    const shouldHydrateHash = !!router.options.ssr
+    let last: LinkState | undefined
+    state = Solid.createMemo(
+      () => {
+        const current = router.stores.location.get()
+        const opts = readRouteOptions(options)
+        const hydrated = hasHydrated ? hasHydrated() : true
+        // Navigations usually leave a link's inputs unchanged.
+        if (
+          last !== undefined &&
+          last.current.href === current.href &&
+          last.hydrated === hydrated &&
+          sameOptions(last.opts, opts)
+        ) {
+          return last
+        }
+        last = resolveLinkState(
+          router,
+          opts,
+          current,
+          shouldHydrateHash && !hydrated,
+        )
+        last.hydrated = hydrated
+        return last
+      },
+      { lazy: true, equals: sameLinkState },
+    )
+  }
+  const preload = () => state().preload
+
+  let actions: LinkActions | undefined
+  const act = () => (actions ??= createLinkActions(router, options, state))
+
+  let setRef: ((el: Element | null) => void) | undefined
+  // The server allocates what these branches allocate and never runs their
+  // callbacks.
+  if (requestedPreload === 'viewport') {
+    const [ref, setRefSignal] = Solid.createSignal<Element | null>(null)
+    setRef = (el) => {
+      Solid.runWithOwner(null, () => {
+        setRefSignal(el)
+      })
+    }
+    useIntersectionObserver(
+      ref,
+      (e) => act().enqueuePreload(e),
+      () => preload() !== 'viewport',
+    )
+  }
+  if (requestedPreload === 'render') {
+    let hasRenderFetched = false
+    Solid.createEffect(preload, (preloadValue) => {
+      if (hasRenderFetched) {
+        return
+      }
+      if (preloadValue === 'render') {
+        Solid.untrack(() => act().doPreload())
+        hasRenderFetched = true
+      }
+    })
+  }
+
+  const userRef = (el: Element) => {
+    const r = options.ref
+    if (typeof r === 'function') r(el)
+    else if (Array.isArray(r))
+      for (const f of r) if (typeof f === 'function') f(el)
+  }
+
+  const externalHref = Solid.untrack(() => state().externalLink)
+  if (externalHref) {
+    const base = fromLink
+      ? Solid.omit(options, '_asChild', 'children')
+      : options
+    const merged = Solid.merge(
+      Solid.omit(base, ...(LINK_OPTION_KEYS as Set<any>)),
+      {
+        ref: setRef
+          ? (el: Element) => {
+              setRef(el)
+              userRef(el)
+            }
+          : userRef,
+        href: externalHref,
+      },
+      base,
+    )
+    return fromLink ? Solid.omit(merged, 'type') : merged
+  }
+
+  const readers: Record<string, () => unknown> | undefined =
+    server && fromLink && (!options._asChild || options._asChild === 'svg')
+      ? {}
+      : undefined
+  const result: Record<string, any> = {}
+  const forward = (key: string) => {
+    if (readers) readers[key] = FORWARDED
+    else forwardProp(result, options, key)
+  }
+
+  for (const key of Object.keys(options)) {
+    if (LINK_OPTION_KEYS.has(key) || (fromLink && LINK_COMPONENT_KEYS.has(key)))
+      continue
+    forward(key)
+  }
+
+  // On the server a value that reads only data props or the resolved state
+  // needs no getter at all.
+  const plain = (...keys: Array<string>) =>
+    server && !readers && !keys.some((key) => isAccessor(options, key))
+  const define = (key: string, get: () => unknown, eager: boolean) => {
+    if (readers) readers[key] = get
+    else if (!eager)
+      Object.defineProperty(result, key, {
+        get,
+        enumerable: true,
+        configurable: true,
+      })
+    else if (key in result)
+      Object.defineProperty(result, key, {
+        value: get(),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      })
+    else result[key] = get()
+  }
+
+  const resolvedStateProps = () => resolveStateProps(options, state().isActive)
+  // Keys returned by activeProps/inactiveProps are discovered once at setup.
+  Solid.untrack(() => {
+    for (const stateProps of [
+      functionalUpdate(options.activeProps ?? STATIC_ACTIVE_PROPS, {}),
+      functionalUpdate(options.inactiveProps ?? EMPTY_OBJECT, {}),
+    ]) {
+      if (stateProps) {
+        for (const key of Object.keys(stateProps)) {
+          if (key !== 'class' && key !== 'style')
+            define(
+              key,
+              () => resolvedStateProps()[key],
+              plain('activeProps', 'inactiveProps'),
+            )
+        }
+      }
+    }
   })
 
-  const _options = () => options
+  if (setRef) {
+    const ref = (el: Element) => {
+      setRef(el)
+      userRef(el)
+    }
+    define('ref', () => ref, true)
+  } else if ('ref' in options) {
+    forward('ref')
+  }
 
-  const next = Solid.createMemo(
-    () => {
-      // Rebuild when inherited search/hash or the current route context changes.
-      const _fromLocation = currentLocation()
-      const options = { _fromLocation, ..._options() } as any
-      // untrack because router-core will also access stores, which are signals in solid
-      return Solid.untrack(() => router.buildLocation(options))
-    },
-    {
-      lazy: true,
-      // Navigations usually leave most links' built locations unchanged;
-      // comparing hrefs lets downstream memos (href, isActive) skip work.
-      equals: (prev, next) =>
-        prev.href === next.href &&
-        prev.external === next.external &&
-        prev.maskedLocation?.href === next.maskedLocation?.href,
-    },
-  )
+  // The server never runs a handler, and a handler creates no owner.
+  if (!server) {
+    result.onClick = (
+      e: MouseEvent & { currentTarget: Element; target: Element },
+    ) => {
+      const handler = options.onClick
+      if (!handler || !callHandler(e, handler)) act().handleClick(e)
+    }
 
-  const hrefOption = Solid.createMemo(
-    () => {
-      if (_options().disabled) return undefined
-      // Use publicHref - it contains the correct href for display
-      // When a rewrite changes the origin, publicHref is the full URL
-      // Otherwise it's the origin-stripped path
-      // This avoids constructing URL objects in the hot path
-      const location = next().maskedLocation ?? next()
-      const publicHref = location.publicHref
-      const external = location.external
-
-      if (external) {
-        return { href: publicHref, external: true }
+    // Intent preloading is all these handlers do, and Solid does not delegate
+    // mouseenter/mouseleave/focus/blur: a handler handed out anyway is a real
+    // listener per anchor. A link that can never preload on intent (no
+    // `preload` prop and another default) passes the caller's own handlers
+    // through. Otherwise each is a getter resolving to the caller's handler
+    // while intent is off, so spread() installs no listener, and flipping
+    // `preload` back to 'intent' re-runs it.
+    if (requestedPreload === 'intent' || 'preload' in options) {
+      let composed: Partial<Record<IntentKey, (event: any) => void>> | undefined
+      for (const key of INTENT_KEYS) {
+        define(
+          key,
+          () => {
+            if (preload() !== 'intent') return options[key]
+            composed ??= {}
+            return (composed[key] ??= createComposedHandler(
+              () => options[key],
+              (e) => act()[key](e),
+            ))
+          },
+          false,
+        )
       }
-
-      return {
-        href: router.history.createHref(publicHref) || '/',
-        external: false,
+    } else {
+      for (const key of INTENT_KEYS) {
+        if (key in options) forward(key)
       }
-    },
-    { lazy: true },
-  )
+    }
+  }
 
-  const externalLink = Solid.createMemo(
-    () => {
-      const _href = hrefOption()
-      if (_href?.external) {
-        // Block dangerous protocols for external links
-        if (isDangerousProtocol(_href.href, router.protocolAllowlist)) {
-          if (process.env.NODE_ENV !== 'production') {
-            console.warn(`Blocked Link with dangerous protocol: ${_href.href}`)
-          }
-          return undefined
+  const stylePlain = plain('class', 'style', 'activeProps', 'inactiveProps')
+  define('href', () => state().href, server)
+  define('disabled', () => !!options.disabled, plain('disabled'))
+  define('target', () => options.target, plain('target'))
+  define(
+    'role',
+    () => (options.disabled ? 'link' : options.role),
+    plain('disabled', 'role'),
+  )
+  define(
+    'aria-disabled',
+    () => (options.disabled ? 'true' : undefined),
+    plain('disabled'),
+  )
+  define('data-status', () => (state().isActive ? 'active' : undefined), server)
+  define('aria-current', () => (state().isActive ? 'page' : undefined), server)
+  define(
+    'class',
+    () => stateClass(options, state().isActive, resolvedStateProps()),
+    stylePlain,
+  )
+  define('style', () => stateStyle(options, resolvedStateProps()), stylePlain)
+
+  if (readers) {
+    const read = readers
+    let snapshot: Record<string, unknown> | undefined
+    return () => {
+      if (!snapshot) {
+        snapshot = {}
+        for (const key in read) {
+          const reader = read[key]!
+          const value = reader === FORWARDED ? options[key] : reader()
+          // What ssrElement would skip anyway; it still pays per key it walks.
+          if (value != null && value !== false) snapshot[key] = value
         }
-        return _href.href
       }
-      const to = _options().to
-      const safeInternal = isSafeInternal(to)
-      if (safeInternal) return undefined
-      if (typeof to !== 'string' || to.indexOf(':') === -1) return undefined
-      try {
-        new URL(to as any)
-        // Block dangerous protocols like javascript:, blob:, data:
-        if (isDangerousProtocol(to, router.protocolAllowlist)) {
-          if (process.env.NODE_ENV !== 'production') {
-            console.warn(`Blocked Link with dangerous protocol: ${to}`)
-          }
-          return undefined
-        }
-        return to
-      } catch {}
-      return undefined
-    },
-    { lazy: true },
-  )
+      return snapshot
+    }
+  }
+  return result
+}
 
-  const preload = Solid.createMemo(
-    () => {
-      if (_options().reloadDocument || externalLink() || local.disabled) {
-        return false
-      }
-      return local.preload ?? router.options.defaultPreload
-    },
-    { lazy: true },
-  )
+type LinkActions = ReturnType<typeof createLinkActions>
+
+/**
+ * What a link does when used: navigate, preload, cancel a pending preload.
+ * Built on the first event that needs it, so rendering or hydrating a link
+ * allocates none of it. Everything here reads the link's state untracked: it
+ * runs in event handlers and effects, outside any tracking scope.
+ */
+function createLinkActions(
+  router: AnyRouter,
+  options: Record<string, any>,
+  state: Solid.Accessor<LinkState>,
+) {
+  const peekPreload = () => Solid.untrack(state).preload
   const preloadDelay = () =>
-    local.preloadDelay ?? router.options.defaultPreloadDelay ?? 0
-
-  const isActive = Solid.createMemo(
-    () => {
-      if (externalLink()) return false
-      const activeOptions = local.activeOptions
-      const current = currentLocation()
-      const nextLocation = next()
-
-      if (activeOptions?.exact) {
-        const testExact = exactPathTest(
-          current.pathname,
-          nextLocation.pathname,
-          router.basepath,
-        )
-        if (!testExact) {
-          return false
-        }
-      } else {
-        const currentPath = removeTrailingSlash(
-          current.pathname,
-          router.basepath,
-        )
-        const nextPath = removeTrailingSlash(
-          nextLocation.pathname,
-          router.basepath,
-        )
-
-        const pathIsFuzzyEqual =
-          currentPath.startsWith(nextPath) &&
-          (currentPath.length === nextPath.length ||
-            currentPath[nextPath.length] === '/')
-        if (!pathIsFuzzyEqual) {
-          return false
-        }
-      }
-
-      if (activeOptions?.includeSearch ?? true) {
-        const searchTest = deepEqual(current.search, nextLocation.search, {
-          partial: !activeOptions?.exact,
-          ignoreUndefined: !activeOptions?.explicitUndefined,
-        })
-        if (!searchTest) {
-          return false
-        }
-      }
-
-      if (activeOptions?.includeHash) {
-        const currentHash =
-          shouldHydrateHash && !hasHydrated() ? '' : current.hash
-        return currentHash === nextLocation.hash
-      }
-      return true
-    },
-    { lazy: true },
-  )
+    options.preloadDelay ?? router.options.defaultPreloadDelay ?? 0
 
   const doPreload = () =>
     router
-      .preloadRoute({ ...options, _builtLocation: next() } as any)
+      .preloadRoute({
+        ...Solid.untrack(() => readRouteOptions(options)),
+        _builtLocation: Solid.untrack(state).next,
+      } as any)
       .catch((err: any) => {
         console.warn(err)
         console.warn(preloadWarning)
       })
 
-  const [ref, setRefSignal] = Solid.createSignal<Element | null>(null)
-
-  const setRef = (el: Element | null) => {
-    Solid.runWithOwner(null, () => {
-      setRefSignal(el)
-    })
-  }
+  // Per-link identity for the preload timer.
+  const timerKey = state
 
   const enqueuePreload = (
     e?: MouseEvent | FocusEvent | IntersectionObserverEntry,
   ) => {
     if (!e) {
-      cancelPreload(ref)
+      cancelPreload(timerKey)
       return
     }
 
     if (
       !(
         (e as IntersectionObserverEntry).isIntersecting ??
-        preload() === 'intent'
+        peekPreload() === 'intent'
       )
     ) {
       if ((e as IntersectionObserverEntry).isIntersecting === false) {
-        cancelPreload(ref)
+        cancelPreload(timerKey)
       }
       return
     }
@@ -317,65 +612,33 @@ export function useLinkProps<
       return
     }
 
-    if (!timeoutMap.has(ref)) {
+    if (!timeoutMap.has(timerKey)) {
       timeoutMap.set(
-        ref,
+        timerKey,
         setTimeout(() => {
-          timeoutMap.delete(ref)
+          timeoutMap.delete(timerKey)
           doPreload()
         }, preloadDelay()),
       )
     }
   }
 
-  useIntersectionObserver(ref, enqueuePreload, () => preload() !== 'viewport')
-
-  Solid.createEffect(preload, (preloadValue) => {
-    if (hasRenderFetched) {
-      return
+  const handleLeave = () => {
+    if (peekPreload() === 'intent') {
+      cancelPreload(timerKey)
     }
-    if (preloadValue === 'render') {
-      Solid.untrack(() => doPreload())
-      hasRenderFetched = true
-    }
-  })
-
-  if (Solid.untrack(externalLink)) {
-    const externalHref = Solid.untrack(externalLink)
-    return Solid.merge(
-      propsSafeToSpread,
-      {
-        ref: mergeRefs(setRef, options.ref),
-        href: externalHref,
-      },
-      splitProps(local, [
-        'target',
-        'disabled',
-        'style',
-        'class',
-        'onClick',
-        'onBlur',
-        'onFocus',
-        'onMouseEnter',
-        'onMouseLeave',
-        'onMouseOut',
-        'onMouseOver',
-        'onTouchStart',
-      ])[0],
-    ) as any
   }
 
-  // The click handler
   const handleClick = (e: MouseEvent) => {
     // Check actual element's target attribute as fallback
     const elementTarget = (
       e.currentTarget as HTMLAnchorElement | SVGAElement
     ).getAttribute('target')
     const effectiveTarget =
-      local.target !== undefined ? local.target : elementTarget
+      options.target !== undefined ? options.target : elementTarget
 
     if (
-      !local.disabled &&
+      !options.disabled &&
       !isCtrlEvent(e) &&
       !e.defaultPrevented &&
       (!effectiveTarget || effectiveTarget === '_self') &&
@@ -386,187 +649,98 @@ export function useLinkProps<
       // All is well? Navigate!
       // N.B. we don't call `router.commitLocation(next) here because we want to run `validateSearch` before committing
       router.navigate({
-        ...options,
-        replace: local.replace,
-        resetScroll: local.resetScroll,
-        hashScrollIntoView: local.hashScrollIntoView,
-        startTransition: local.startTransition,
-        viewTransition: local.viewTransition,
-        ignoreBlocker: local.ignoreBlocker,
-      })
+        ...Solid.untrack(() => readRouteOptions(options)),
+        replace: options.replace,
+        resetScroll: options.resetScroll,
+        hashScrollIntoView: options.hashScrollIntoView,
+        startTransition: options.startTransition,
+        viewTransition: options.viewTransition,
+        ignoreBlocker: options.ignoreBlocker,
+      } as any)
     }
   }
 
-  const handleTouchStart = () => {
-    if (preload() !== 'intent') return
-    doPreload()
-  }
-
-  const handleLeave = () => {
-    if (preload() === 'intent') {
-      cancelPreload(ref)
-    }
-  }
-
-  const simpleStyling = Solid.createMemo(
-    () =>
-      activeProps() === STATIC_ACTIVE_PROPS_GET &&
-      inactiveProps() === STATIC_INACTIVE_PROPS_GET &&
-      local.class === undefined &&
-      local.style === undefined,
-    { lazy: true },
-  )
-
-  const onClick = createComposedHandler(() => local.onClick, handleClick)
-  const onBlur = createComposedHandler(() => local.onBlur, handleLeave)
-  const onFocus = createComposedHandler(() => local.onFocus, enqueuePreload)
-  const onMouseEnter = createComposedHandler(
-    () => local.onMouseEnter,
+  return {
+    doPreload,
     enqueuePreload,
-  )
-  const onMouseOver = createComposedHandler(
-    () => local.onMouseOver,
-    enqueuePreload,
-  )
-  const onMouseLeave = createComposedHandler(
-    () => local.onMouseLeave,
-    handleLeave,
-  )
-  const onMouseOut = createComposedHandler(() => local.onMouseOut, handleLeave)
-  const onTouchStart = createComposedHandler(
-    () => local.onTouchStart,
-    handleTouchStart,
-  )
-
-  type ResolvedLinkStateProps = Omit<ComponentProps<'a'>, 'style'> & {
-    style?: JSX.CSSProperties
-  }
-
-  const resolvedStateProps = Solid.createMemo(
-    (): ResolvedLinkStateProps =>
-      (isActive()
-        ? functionalUpdate(activeProps() as any, {})
-        : functionalUpdate(inactiveProps(), {})) ?? EMPTY_OBJECT,
-    { lazy: true },
-  )
-
-  const resolvedClass = Solid.createMemo(
-    () => {
-      if (simpleStyling()) return isActive() ? 'active' : undefined
-      return (
-        [local.class, resolvedStateProps().class].filter(Boolean).join(' ') ||
-        undefined
-      )
+    handleClick,
+    onBlur: handleLeave,
+    onFocus: enqueuePreload,
+    onMouseEnter: enqueuePreload,
+    onMouseOver: enqueuePreload,
+    onMouseLeave: handleLeave,
+    onMouseOut: handleLeave,
+    onTouchStart: () => {
+      if (peekPreload() === 'intent') doPreload()
     },
-    { lazy: true },
-  )
+  } satisfies Record<IntentKey, (event: any) => void> & Record<string, unknown>
+}
 
-  const resolvedStyle = Solid.createMemo(
-    () => {
-      if (simpleStyling()) return local.style
-      const style = { ...local.style, ...resolvedStateProps().style }
-      return hasKeys(style) ? style : undefined
-    },
-    { lazy: true },
-  )
-
-  // The returned object must be a plain object with a stable key set so the
-  // consuming spread() never enumerates through proxy traps. Reactivity lives
-  // in the property getters; values that no longer apply resolve to undefined,
-  // which spread()/assign() treats as attribute removal. Keys returned by
-  // activeProps/inactiveProps are discovered once at setup.
-  const extraStateKeys = new Set<string>()
-  Solid.untrack(() => {
-    for (const stateProps of [
-      functionalUpdate(activeProps() as any, {}),
-      functionalUpdate(inactiveProps(), {}),
-    ]) {
-      if (stateProps) {
-        for (const key of Object.keys(stateProps)) {
-          if (key !== 'class' && key !== 'style') extraStateKeys.add(key)
-        }
+function externalTo(to: unknown, router: AnyRouter) {
+  if (isSafeInternal(to)) return undefined
+  if (typeof to !== 'string' || to.indexOf(':') === -1) return undefined
+  try {
+    new URL(to)
+    // Block dangerous protocols like javascript:, blob:, data:
+    if (isDangerousProtocol(to, router.protocolAllowlist)) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.warn(`Blocked Link with dangerous protocol: ${to}`)
       }
+      return undefined
     }
-  })
+    return to
+  } catch {}
+  return undefined
+}
 
-  const composedRef = mergeRefs(setRef, (el: Element) => {
-    const r = _options().ref as any
-    if (typeof r === 'function') r(el)
-  })
-
-  const linkProps: Record<string, any> = {}
-  for (const key of Object.keys(propsSafeToSpread)) {
-    Object.defineProperty(
-      linkProps,
-      key,
-      Object.getOwnPropertyDescriptor(propsSafeToSpread, key)!,
+function testActive(
+  activeOptions: Record<string, any> | undefined,
+  current: ParsedLocation,
+  nextLocation: ParsedLocation,
+  router: AnyRouter,
+  hideHash: boolean,
+) {
+  if (activeOptions?.exact) {
+    const testExact = exactPathTest(
+      current.pathname,
+      nextLocation.pathname,
+      router.basepath,
     )
-  }
-  for (const key of extraStateKeys) {
-    Object.defineProperty(linkProps, key, {
-      get: () => (resolvedStateProps() as Record<string, any>)[key],
-      enumerable: true,
-      configurable: true,
-    })
-  }
+    if (!testExact) {
+      return false
+    }
+  } else {
+    const currentPath = removeTrailingSlash(current.pathname, router.basepath)
+    const nextPath = removeTrailingSlash(nextLocation.pathname, router.basepath)
 
-  const defineGetters = (getters: Record<string, () => any>) => {
-    for (const key of Object.keys(getters)) {
-      Object.defineProperty(linkProps, key, {
-        get: getters[key],
-        enumerable: true,
-        configurable: true,
-      })
+    const pathIsFuzzyEqual =
+      currentPath.startsWith(nextPath) &&
+      (currentPath.length === nextPath.length ||
+        currentPath[nextPath.length] === '/')
+    if (!pathIsFuzzyEqual) {
+      return false
     }
   }
 
-  linkProps.ref = composedRef
-  linkProps.onClick = onClick
+  if (activeOptions?.includeSearch ?? true) {
+    const searchTest = deepEqual(current.search, nextLocation.search, {
+      partial: !activeOptions?.exact,
+      ignoreUndefined: !activeOptions?.explicitUndefined,
+    })
+    if (!searchTest) {
+      return false
+    }
+  }
 
-  // Intent preloading is the only thing these handlers do, and each of them
-  // already bails at a `preload() !== 'intent'` gate. Handing them out anyway
-  // is not free: Solid does not delegate mouseenter/mouseleave/focus/blur, so
-  // every anchor installs four real listeners that exist only to return. On a
-  // list view — a table of rows, a calendar of spans — that is four listeners
-  // per row for no behaviour at all.
-  //
-  // So when intent preloading is off, the property resolves to whatever the
-  // user passed (or undefined), and spread()/assign() installs nothing. The
-  // getters keep this reactive: flipping `preload` back to 'intent' re-runs
-  // the consuming spread, which attaches the composed handler then.
-  const onIntent =
-    (composed: (event: any) => void, user: () => unknown) => () =>
-      preload() === 'intent' ? composed : user()
-
-  defineGetters({
-    onBlur: onIntent(onBlur, () => local.onBlur),
-    onFocus: onIntent(onFocus, () => local.onFocus),
-    onMouseEnter: onIntent(onMouseEnter, () => local.onMouseEnter),
-    onMouseOver: onIntent(onMouseOver, () => local.onMouseOver),
-    onMouseLeave: onIntent(onMouseLeave, () => local.onMouseLeave),
-    onMouseOut: onIntent(onMouseOut, () => local.onMouseOut),
-    onTouchStart: onIntent(onTouchStart, () => local.onTouchStart),
-  })
-
-  defineGetters({
-    href: () => hrefOption()?.href,
-    disabled: () => !!local.disabled,
-    target: () => local.target,
-    role: () => (local.disabled ? 'link' : propsSafeToSpread.role),
-    'aria-disabled': () => (local.disabled ? 'true' : undefined),
-    'data-status': () => (isActive() ? 'active' : undefined),
-    'aria-current': () => (isActive() ? 'page' : undefined),
-    class: resolvedClass,
-    style: resolvedStyle,
-  })
-
-  return linkProps as any
+  if (activeOptions?.includeHash) {
+    const currentHash = hideHash ? '' : current.hash
+    return currentHash === nextLocation.hash
+  }
+  return true
 }
 
 const STATIC_ACTIVE_PROPS = { class: 'active' }
-const STATIC_ACTIVE_PROPS_GET = () => STATIC_ACTIVE_PROPS
 const EMPTY_OBJECT = {}
-const STATIC_INACTIVE_PROPS_GET = () => EMPTY_OBJECT
 
 /** Call a JSX.EventHandlerUnion with the event. */
 function callHandler<T, TEvent extends Event>(
@@ -707,33 +881,36 @@ export function createLink<const TComp>(
 }
 
 export const Link: LinkComponent<'a'> = (props) => {
-  const [local, rest] = splitProps(props as typeof props & { _asChild: any }, [
-    '_asChild',
-    'children',
-  ])
-  const [_, linkProps] = splitProps(useLinkProps(rest as unknown as any), [
-    'type',
-  ])
+  const p = props as typeof props & { _asChild?: any }
+  // An object, or on the server for a plain anchor the function that returns
+  // it (see linkProps).
+  const anchorProps = linkProps(p as Record<string, any>, true)
+  const readAnchorProps = () =>
+    typeof anchorProps === 'function' ? anchorProps() : anchorProps
+  const renderProp = (ch: Function) =>
+    ch({
+      get isActive() {
+        return readAnchorProps()['data-status'] === 'active'
+      },
+    })
 
-  // Resolve children once using Solid.children to avoid
-  // re-accessing the children getter (which in Solid 2.0 would
-  // re-invoke createComponent each time for JSX children).
-  const resolvedChildren = Solid.children(() => local.children as JSX.Element)
+  // A plain anchor reads the children getter once per run of its own child
+  // slot, so it needs no children() memo: a render prop is called with the
+  // link state, anything else is left for the slot to resolve.
   const children = () => {
-    const ch = resolvedChildren()
-    if (typeof ch === 'function') {
-      return (ch as Function)({
-        get isActive() {
-          return (linkProps as any)['data-status'] === 'active'
-        },
-      })
-    }
-
+    const ch = p.children
+    if (typeof ch === 'function' && ch.length) return renderProp(ch)
     return ch
   }
 
-  if (local._asChild === 'svg') {
-    const [_, svgLinkProps] = splitProps(linkProps as any, ['class'])
+  if (p._asChild === 'svg') {
+    const svgLinkProps =
+      typeof anchorProps === 'function'
+        ? () => {
+            const { class: _, ...rest } = anchorProps()
+            return rest
+          }
+        : splitProps(anchorProps, ['class'])[1]
     return (
       <svg>
         <a {...svgLinkProps}>{children()}</a>
@@ -741,13 +918,22 @@ export const Link: LinkComponent<'a'> = (props) => {
     )
   }
 
-  if (!local._asChild) {
-    return <a {...linkProps}>{children()}</a>
+  if (!p._asChild) {
+    return <a {...anchorProps}>{children()}</a>
+  }
+
+  // A host component may read `children` more than once, and each read of the
+  // getter would build them again.
+  const resolvedChildren = Solid.children(() => p.children as JSX.Element)
+  const hostChildren = () => {
+    const ch = resolvedChildren()
+    if (typeof ch === 'function') return renderProp(ch)
+    return ch
   }
 
   return (
-    <Dynamic component={local._asChild as ValidComponent} {...linkProps}>
-      {children()}
+    <Dynamic component={p._asChild as ValidComponent} {...anchorProps}>
+      {hostChildren()}
     </Dynamic>
   )
 }

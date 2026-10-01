@@ -74,3 +74,12 @@ export function useHydrated(): Solid.Accessor<boolean> {
 
   return hydrated
 }
+
+/**
+ * Records that the app has rendered on the client, so a `useHydrated()`
+ * created from now on starts at `true`. Called by the router once its first
+ * render settles; any `useHydrated()` effect records it too.
+ */
+export function markHydrated() {
+  globalHydrated = true
+}
